@@ -113,17 +113,22 @@ jobs:
       - name: Check whether this commit is already published
         id: existing
         env:
-          GH_TOKEN: ${{ github.token }}
           SHORT_SHA: ${{ steps.resolve.outputs.short_sha }}
           FORCE_REBUILD: ${{ inputs.force_rebuild || false }}
         run: |
           set -euo pipefail
 
-          if [[ "${GITHUB_EVENT_NAME}" == "push" || "${FORCE_REBUILD}" == "true" ]]; then
+          if [[ "${FORCE_REBUILD}" == "true" ]]; then
             should_build=true
           else
+            # Authenticate as an anonymous puller: the workflow token has no
+            # read:packages scope, so a plain Bearer-token request to GHCR
+            # answers 403 for a package that exists (and would rebuild every
+            # run). The anonymous token endpoint is scoped to `pull` only and
+            # works for the public package.
+            token="$(curl -fsS "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY_OWNER}/${IMAGE}:pull&service=ghcr.io" | jq -r .token)"
             code="$(curl -s -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Authorization: Bearer ${token}" \
               -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
               "https://ghcr.io/v2/${GITHUB_REPOSITORY_OWNER}/${IMAGE}/manifests/sha-${SHORT_SHA}" || true)"
             if [[ "${code}" == "200" ]]; then
