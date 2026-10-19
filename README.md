@@ -62,8 +62,9 @@ list.
 
 ## Environment variables
 
-Only the first two are strictly required. The rest have working defaults inside
-the image.
+`DATABASE_URL` and `OPENAI_API_KEY` are required; everything else has a working
+default inside the image — except `AGENT_RUNTIME_SECRET`, which the server
+refuses to start without once `NODE_ENV=production` (the image's default).
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
