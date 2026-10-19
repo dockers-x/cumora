@@ -1,0 +1,306 @@
+name: Container images
+
+# Automated multi-architecture images for yetone/cumora.
+#
+# Upstream ships its production server Dockerfile at
+# server/docker/cumora-server.Dockerfile (with a matching
+# <Dockerfile>.dockerignore) and already builds it in its own CI, but pushes
+# only to a private Google Artifact Registry. This repository mirrors the
+# latest upstream `main` commit to Docker Hub and GHCR for linux/amd64 and
+# linux/arm64, building with upstream's own Dockerfile so the image
+# definition never drifts from upstream.
+#
+# The image serves three surfaces from one Node process:
+#   /api/*      JSON API
+#   /runtime/*  agent runtime API (JWT-authed)
+#   /*          the React SPA bundle
+# It also ships `kubectl`, which the orchestrator uses to spawn per-agent
+# pods. That path needs a Kubernetes cluster; without one the server still
+# boots and serves the API + SPA. See docker-compose.yml.
+
+on:
+  schedule:
+    # Every six hours: build only when upstream main has moved.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream cumora ref (branch, tag, or SHA; empty = main HEAD)
+        required: false
+        type: string
+      force_rebuild:
+        description: Rebuild even when this commit is already published
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/container.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  # One build at a time: the `latest` tag must never be moved by an older
+  # commit finishing after a newer one.
+  group: cumora-image
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: yetone/cumora
+  # Path to the upstream Dockerfile, relative to the checked-out upstream tree.
+  UPSTREAM_DOCKERFILE: server/docker/cumora-server.Dockerfile
+  IMAGE: cumora
+  DOCKERHUB_NAMESPACE: czyt
+
+jobs:
+  resolve:
+    name: Resolve upstream commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      short_sha: ${{ steps.resolve.outputs.short_sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      is_default_branch: ${{ steps.resolve.outputs.is_default_branch }}
+      should_build: ${{ steps.existing.outputs.should_build }}
+    steps:
+      - name: Resolve and verify upstream commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+
+          ref="${REQUESTED_REF:-main}"
+          sha="$(gh api "repos/${UPSTREAM_REPOSITORY}/commits/${ref}" --jq .sha)"
+          [[ "${sha}" =~ ^[0-9a-f]{40}$ ]]
+          # Same 7-character abbreviation `git rev-parse --short` produces,
+          # which is what upstream's own image tags use.
+          short_sha="$(printf '%.7s' "${sha}")"
+
+          version="$(gh api "repos/${UPSTREAM_REPOSITORY}/contents/package.json?ref=${sha}" \
+            --jq '.content' | base64 -d | jq -r .version)"
+          [[ -n "${version}" && "${version}" != "null" ]]
+
+          # Upstream publishes no release for every main commit, so the image
+          # version tag tracks package.json. Only the current upstream HEAD may
+          # move `latest`.
+          default_branch="$(gh api "repos/${UPSTREAM_REPOSITORY}" --jq .default_branch)"
+          head="$(gh api "repos/${UPSTREAM_REPOSITORY}/commits/${default_branch}" --jq .sha)"
+          is_default_branch=false
+          if [[ "${sha}" == "${head}" ]]; then
+            is_default_branch=true
+          fi
+
+          {
+            echo "sha=${sha}"
+            echo "short_sha=${short_sha}"
+            echo "version=${version}"
+            echo "is_default_branch=${is_default_branch}"
+          } >>"${GITHUB_OUTPUT}"
+
+          {
+            echo "### Cumora upstream"
+            echo
+            echo "- ref: \`${ref}\`"
+            echo "- commit: \`${sha}\`"
+            echo "- version: \`${version}\`"
+            echo "- on default branch: \`${is_default_branch}\`"
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Check whether this commit is already published
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT_SHA: ${{ steps.resolve.outputs.short_sha }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild || false }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" || "${FORCE_REBUILD}" == "true" ]]; then
+            should_build=true
+          else
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/${GITHUB_REPOSITORY_OWNER}/${IMAGE}/manifests/sha-${SHORT_SHA}" || true)"
+            if [[ "${code}" == "200" ]]; then
+              should_build=false
+              echo "::notice::ghcr.io/${GITHUB_REPOSITORY_OWNER}/${IMAGE}:sha-${SHORT_SHA} already exists - skipping build"
+            else
+              should_build=true
+              echo "::notice::sha-${SHORT_SHA} not found (HTTP ${code}) - build required"
+            fi
+          fi
+
+          echo "should_build=${should_build}" >>"${GITHUB_OUTPUT}"
+
+  build:
+    name: Build ${{ matrix.platform }} image
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Native runners per architecture: the image runs a full `npm ci`
+        # twice (runtime deps + SPA build), which is far slower under QEMU
+        # emulation than on a native arm64 runner.
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            platform_tag: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            platform_tag: arm64
+    env:
+      BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      SHORT_SHA: ${{ needs.resolve.outputs.short_sha }}
+    steps:
+      - name: Check out pinned upstream source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify upstream source and image definition
+        env:
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
+          EXPECTED_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${EXPECTED_SHA}"
+          version="$(jq -r .version package.json)"
+          test "${version}" = "${EXPECTED_VERSION}"
+          test -f "${UPSTREAM_DOCKERFILE}"
+          test -f "${UPSTREAM_DOCKERFILE}.dockerignore"
+
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push native image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ env.UPSTREAM_DOCKERFILE }}
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            docker.io/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE }}:build-${{ env.SHORT_SHA }}-${{ env.BUILD_ID }}-${{ matrix.platform_tag }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE }}:build-${{ env.SHORT_SHA }}-${{ env.BUILD_ID }}-${{ matrix.platform_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ env.UPSTREAM_REPOSITORY }}
+            org.opencontainers.image.title=Cumora server
+            org.opencontainers.image.description=Where agent teams gather - API, agent runtime and web client in one image
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha,scope=cumora-${{ matrix.platform_tag }}
+          cache-to: type=gha,mode=max,scope=cumora-${{ matrix.platform_tag }}
+          provenance: true
+          sbom: true
+
+  publish:
+    name: Publish multi-platform manifests
+    needs: [resolve, build]
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      SHORT_SHA: ${{ needs.resolve.outputs.short_sha }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      IS_DEFAULT_BRANCH: ${{ needs.resolve.outputs.is_default_branch }}
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and verify manifests
+        run: |
+          set -euo pipefail
+
+          images=(
+            "docker.io/${DOCKERHUB_NAMESPACE}/${IMAGE}"
+            "ghcr.io/${GITHUB_REPOSITORY_OWNER}/${IMAGE}"
+          )
+
+          for image in "${images[@]}"; do
+            tags=(
+              --tag "${image}:sha-${SHORT_SHA}"
+              --tag "${image}:${VERSION}"
+            )
+            # Only the current upstream HEAD may move `latest`; a rebuild of
+            # an older commit (manual dispatch) must not.
+            if [[ "${IS_DEFAULT_BRANCH}" == "true" ]]; then
+              tags+=(--tag "${image}:latest")
+            fi
+
+            docker buildx imagetools create "${tags[@]}" \
+              "${image}:build-${SHORT_SHA}-${BUILD_ID}-amd64" \
+              "${image}:build-${SHORT_SHA}-${BUILD_ID}-arm64"
+
+            docker buildx imagetools inspect --raw "${image}:sha-${SHORT_SHA}" \
+              | jq -e '
+                  [.manifests[]?.platform
+                    | select(.os == "linux")
+                    | .architecture] as $architectures
+                  | ($architectures | index("amd64")) != null
+                    and ($architectures | index("arm64")) != null
+                ' >/dev/null
+          done
+
+      - name: Make the GHCR package public
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method PATCH \
+            "orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${IMAGE}" \
+            -f visibility=public
+
+      - name: Summary
+        run: |
+          {
+            echo "### Cumora image published"
+            echo
+            echo "- commit: \`${SHORT_SHA}\`"
+            echo "- version: \`${VERSION}\`"
+            echo "- tags: \`sha-${SHORT_SHA}\`, \`${VERSION}\`$([[ "${IS_DEFAULT_BRANCH}" == "true" ]] && echo ', `latest`')"
+            echo "- platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo
+            echo '```'
+            echo "docker.io/${DOCKERHUB_NAMESPACE}/${IMAGE}:sha-${SHORT_SHA}"
+            echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/${IMAGE}:sha-${SHORT_SHA}"
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"

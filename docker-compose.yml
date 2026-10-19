@@ -1,0 +1,110 @@
+# Community self-hosting example for the Cumora images built in this
+# repository. This is a starting point, not an officially supported
+# deployment: upstream (yetone/cumora) ships the production Dockerfile and
+# Kubernetes manifests, but no compose stack.
+#
+# Topology:
+#   browser -> server :5181 -> /api/*   JSON API
+#                           -> /runtime/* agent runtime API (JWT-authed)
+#                           -> /*        React SPA bundle
+#   server  -> postgres (pgvector), redis
+#
+# First run:
+#   cp .env.example .env    # set OPENAI_API_KEY and AGENT_RUNTIME_SECRET
+#   docker compose up -d
+#   open http://localhost:5181
+#
+# The one-shot `migrate` service applies the database schema before `server`
+# starts. Application pods only verify the migration ledger; they never run
+# DDL on boot.
+#
+# Cloud agents: upstream runs each agent in its own Kubernetes pod, created by
+# the server through `kubectl`. This stack has no cluster, so cloud agents
+# cannot start here; the kubectl-dependent background jobs are switched off
+# below. Use a BYOA daemon (`cumora agent computer`, see docs/BYOA.md) to
+# drive a local Claude Code / Codex / ... as the agent brain instead, or
+# deploy the server to Kubernetes with upstream's server/k8s manifests.
+
+name: cumora
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cumora}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-cumora}
+    volumes:
+      - cumora-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cumora} -d ${POSTGRES_DB:-cumora}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    image: ${CUMORA_IMAGE:-ghcr.io/dockers-x/cumora:latest}
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-cumora}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-cumora}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+    command: ["npm", "run", "migrate"]
+
+  server:
+    image: ${CUMORA_IMAGE:-ghcr.io/dockers-x/cumora:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "5181:5181"
+    volumes:
+      # Local attachment storage (server/uploads). Ignored when R2_* is set.
+      - cumora-uploads:/app/server/uploads
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-cumora}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-cumora}
+      REDIS_URL: redis://redis:6379
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      AGENT_RUNTIME_SECRET: ${AGENT_RUNTIME_SECRET:?set AGENT_RUNTIME_SECRET in .env}
+      PUBLIC_HOST: ${PUBLIC_HOST:-}
+      CUMORA_CORS_ORIGINS: ${CUMORA_CORS_ORIGINS:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      OPENAI_MODEL_SUPPORT: ${OPENAI_MODEL_SUPPORT:-}
+      R2_ENDPOINT: ${R2_ENDPOINT:-}
+      R2_BUCKET: ${R2_BUCKET:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      # No Kubernetes cluster in this stack: disable the jobs that shell out
+      # to kubectl (agent-pod GC, Chrome-profile PVC GC, fuse-pressure
+      # monitor). Everything else keeps running.
+      ENABLE_AGENT_POD_GC: "false"
+      ENABLE_CHROME_PVC_GC: "false"
+      ENABLE_CLUSTER_MONITOR: "false"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5181/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+volumes:
+  cumora-postgres-data:
+  cumora-uploads:
