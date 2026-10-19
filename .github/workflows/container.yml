@@ -281,13 +281,20 @@ jobs:
           done
 
       - name: Make the GHCR package public
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api --method PATCH \
-            "orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${IMAGE}" \
-            -f visibility=public
+          # Best effort. New GHCR packages inherit the org's visibility, so
+          # this is usually a no-op; flipping it explicitly needs admin:org,
+          # which the workflow token does not carry. Never fail the publish
+          # for a cosmetic permission miss.
+          if gh api --method PATCH \
+               "orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${IMAGE}" \
+               -f visibility=public >/dev/null 2>&1; then
+            echo "GHCR package visibility set to public"
+          else
+            echo "::notice::Could not set GHCR package visibility (needs admin:org); it stays at the org default"
+          fi
 
       - name: Summary
         run: |
