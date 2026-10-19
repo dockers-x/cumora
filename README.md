@@ -1,7 +1,7 @@
 # cumora container image
 
 Multi-platform container images for [Cumora](https://github.com/yetone/cumora),
-automatically built from upstream `main`.
+automatically built from upstream `main` and its release tags.
 
 Images are published to:
 
@@ -51,11 +51,19 @@ migration ledger and never execute DDL on boot.
 
 ## Tags
 
-| Tag | Meaning |
-| --- | --- |
-| `sha-<7-char commit>` | Exact upstream commit. Immutable; use this for deployments. |
-| `<version>` | Upstream `package.json` version (e.g. `0.18.7`). Moves when upstream releases. |
-| `latest` | Newest upstream `main` commit. Moves on every upstream push. |
+Two images are tracked, and each carries only the tags that are true of it:
+
+| Tag | Attached to | Meaning |
+| --- | --- | --- |
+| `latest` | upstream `main` HEAD | Newest upstream commit synced from `main`. Moves on every upstream push. |
+| `<version>` | the upstream release tag's commit | A released upstream version, e.g. `0.18.7`. Never moves once published. |
+| `sha-<7-char commit>` | any tracked commit | Exact upstream commit. Immutable; use this for deployments. |
+
+A version tag is attached **only** to the commit the upstream `vX.Y.Z` tag
+points at — never to `main` just because `main`'s `package.json` happens to
+carry that version (upstream's `main` version lags the latest tag). `latest`
+follows `main`; the newest version tag follows the latest upstream release.
+When `main`'s HEAD is itself a released commit, one image gets all three.
 
 `linux/amd64` and `linux/arm64` are published under the same tag as a manifest
 list.
@@ -103,16 +111,20 @@ instead of this compose file.
 ## Release automation
 
 [`.github/workflows/container.yml`](.github/workflows/container.yml) checks
-upstream `main` every six hours. When the commit has not been built yet it:
+upstream every six hours and builds only what is missing:
 
-1. resolves and verifies the upstream commit and its `package.json` version,
-2. builds `linux/amd64` and `linux/arm64` natively on GitHub-hosted runners,
-3. publishes a manifest list to Docker Hub and GHCR, and
-4. tags the image with `sha-<commit>`, the upstream version, and (for the
-   current upstream HEAD) `latest`.
+1. **main sync** — the upstream default-branch head, tagged `sha-<commit>` and
+   `latest`.
+2. **latest release** — the commit the highest upstream `vX.Y.Z` tag points at,
+   tagged `sha-<commit>` and `<version>`.
 
-The workflow can also be dispatched manually with a specific upstream ref, and
-`force_rebuild` republishes a commit after container-only fixes.
+Both are built for `linux/amd64` and `linux/arm64` natively on GitHub-hosted
+runners and published as one manifest list to Docker Hub and GHCR. An image is
+skipped when its `sha-<commit>` tag already exists.
+
+The workflow can also be dispatched manually: `upstream_ref` pins the main sync
+to a specific ref, and `force_rebuild` republishes commits after container-only
+fixes.
 
 Builds use upstream's own `server/docker/cumora-server.Dockerfile` from the
 pinned commit, so the image definition never drifts from upstream — this

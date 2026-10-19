@@ -5,10 +5,21 @@ name: Container images
 # Upstream ships its production server Dockerfile at
 # server/docker/cumora-server.Dockerfile (with a matching
 # <Dockerfile>.dockerignore) and already builds it in its own CI, but pushes
-# only to a private Google Artifact Registry. This repository mirrors the
-# latest upstream `main` commit to Docker Hub and GHCR for linux/amd64 and
-# linux/arm64, building with upstream's own Dockerfile so the image
-# definition never drifts from upstream.
+# only to a private Google Artifact Registry. This repository republishes that
+# image to Docker Hub and GHCR for linux/amd64 and linux/arm64, building with
+# upstream's own Dockerfile so the image definition never drifts from upstream.
+#
+# Two kinds of images are tracked, and each carries only the tags that are true
+# of it:
+#
+#   * main sync     -> `sha-<commit>` + `latest`
+#   * release tag   -> `sha-<commit>` + `<version>` (from the upstream v* tag)
+#
+# A version tag is only ever attached to the exact commit the upstream release
+# tag points at. `package.json` is deliberately NOT used as a version: on main
+# it lags the released tag (main can sit at 0.18.7 while v0.18.8 is tagged
+# later), so keying tags off it would publish a version tag for a commit that
+# upstream never released.
 #
 # The image serves three surfaces from one Node process:
 #   /api/*      JSON API
@@ -20,16 +31,16 @@ name: Container images
 
 on:
   schedule:
-    # Every six hours: build only when upstream main has moved.
+    # Every six hours: build only when a tracked commit has moved.
     - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: Upstream cumora ref (branch, tag, or SHA; empty = main HEAD)
+        description: Build this upstream ref as the main sync (branch, tag, or SHA; empty = main HEAD)
         required: false
         type: string
       force_rebuild:
-        description: Rebuild even when this commit is already published
+        description: Rebuild even when the tracked commits are already published
         required: false
         default: false
         type: boolean
@@ -38,8 +49,8 @@ permissions:
   contents: read
 
 concurrency:
-  # One build at a time: the `latest` tag must never be moved by an older
-  # commit finishing after a newer one.
+  # One build at a time: `latest` must never be moved by an older commit
+  # finishing after a newer one.
   group: cumora-image
   cancel-in-progress: false
 
@@ -52,100 +63,137 @@ env:
 
 jobs:
   resolve:
-    name: Resolve upstream commit
+    name: Resolve upstream targets
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
-      packages: read
     outputs:
-      sha: ${{ steps.resolve.outputs.sha }}
-      short_sha: ${{ steps.resolve.outputs.short_sha }}
-      version: ${{ steps.resolve.outputs.version }}
-      is_default_branch: ${{ steps.resolve.outputs.is_default_branch }}
-      should_build: ${{ steps.existing.outputs.should_build }}
+      has_targets: ${{ steps.plan.outputs.has_targets }}
+      targets: ${{ steps.plan.outputs.targets }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - name: Resolve and verify upstream commit
-        id: resolve
+      - name: Plan the build targets
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_REF: ${{ inputs.upstream_ref }}
-        run: |
-          set -euo pipefail
-
-          ref="${REQUESTED_REF:-main}"
-          sha="$(gh api "repos/${UPSTREAM_REPOSITORY}/commits/${ref}" --jq .sha)"
-          [[ "${sha}" =~ ^[0-9a-f]{40}$ ]]
-          # Same 7-character abbreviation `git rev-parse --short` produces,
-          # which is what upstream's own image tags use.
-          short_sha="$(printf '%.7s' "${sha}")"
-
-          version="$(gh api "repos/${UPSTREAM_REPOSITORY}/contents/package.json?ref=${sha}" \
-            --jq '.content' | base64 -d | jq -r .version)"
-          [[ -n "${version}" && "${version}" != "null" ]]
-
-          # Upstream publishes no release for every main commit, so the image
-          # version tag tracks package.json. Only the current upstream HEAD may
-          # move `latest`.
-          default_branch="$(gh api "repos/${UPSTREAM_REPOSITORY}" --jq .default_branch)"
-          head="$(gh api "repos/${UPSTREAM_REPOSITORY}/commits/${default_branch}" --jq .sha)"
-          is_default_branch=false
-          if [[ "${sha}" == "${head}" ]]; then
-            is_default_branch=true
-          fi
-
-          {
-            echo "sha=${sha}"
-            echo "short_sha=${short_sha}"
-            echo "version=${version}"
-            echo "is_default_branch=${is_default_branch}"
-          } >>"${GITHUB_OUTPUT}"
-
-          {
-            echo "### Cumora upstream"
-            echo
-            echo "- ref: \`${ref}\`"
-            echo "- commit: \`${sha}\`"
-            echo "- version: \`${version}\`"
-            echo "- on default branch: \`${is_default_branch}\`"
-          } >>"${GITHUB_STEP_SUMMARY}"
-
-      - name: Check whether this commit is already published
-        id: existing
-        env:
-          SHORT_SHA: ${{ steps.resolve.outputs.short_sha }}
           FORCE_REBUILD: ${{ inputs.force_rebuild || false }}
         run: |
           set -euo pipefail
 
-          if [[ "${FORCE_REBUILD}" == "true" ]]; then
-            should_build=true
-          else
-            # Authenticate as an anonymous puller: the workflow token has no
-            # read:packages scope, so a plain Bearer-token request to GHCR
-            # answers 403 for a package that exists (and would rebuild every
-            # run). The anonymous token endpoint is scoped to `pull` only and
-            # works for the public package.
-            token="$(curl -fsS "https://ghcr.io/token?scope=repository:${GITHUB_REPOSITORY_OWNER}/${IMAGE}:pull&service=ghcr.io" | jq -r .token)"
+          repo="${UPSTREAM_REPOSITORY}"
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json'
+
+          # Authenticate as an anonymous puller. The workflow token carries no
+          # read:packages scope, so a plain Bearer request answers 403 for a
+          # package that exists and would rebuild every run. The anonymous
+          # token endpoint is scoped to `pull` only and works for a public
+          # package.
+          TOKEN="$(curl -fsS "https://ghcr.io/token?scope=repository:${owner}/${IMAGE}:pull&service=ghcr.io" | jq -r .token)"
+          is_published() { # $1 = short sha
+            local code
             code="$(curl -s -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer ${token}" \
-              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
-              "https://ghcr.io/v2/${GITHUB_REPOSITORY_OWNER}/${IMAGE}/manifests/sha-${SHORT_SHA}" || true)"
-            if [[ "${code}" == "200" ]]; then
-              should_build=false
-              echo "::notice::ghcr.io/${GITHUB_REPOSITORY_OWNER}/${IMAGE}:sha-${SHORT_SHA} already exists - skipping build"
-            else
-              should_build=true
-              echo "::notice::sha-${SHORT_SHA} not found (HTTP ${code}) - build required"
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: ${accept}" \
+              "https://ghcr.io/v2/${owner}/${IMAGE}/manifests/sha-$1" || true)"
+            [[ "${code}" == "200" ]]
+          }
+
+          # --- main sync: the upstream default-branch head -----------------
+          # A manual dispatch may pin a different ref; that build is still the
+          # "newest sync" for tagging purposes.
+          ref="${REQUESTED_REF:-main}"
+          main_sha="$(gh api "repos/${repo}/commits/${ref}" --jq .sha)"
+          [[ "${main_sha}" =~ ^[0-9a-f]{40}$ ]]
+          main_short="${main_sha:0:7}"
+
+          # --- latest release: highest upstream vX.Y.Z tag -----------------
+          # `releases/latest` is stale here (upstream stops creating GitHub
+          # Releases past v0.9.0), so the tag list is the source of truth.
+          latest_tag="$(gh api "repos/${repo}/tags?per_page=100" --paginate --jq '.[].name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+          [[ -n "${latest_tag}" ]]
+
+          object="$(gh api "repos/${repo}/git/ref/tags/${latest_tag}" --jq '.object.type + " " + .object.sha')"
+          read -r object_type object_sha <<<"${object}"
+          if [[ "${object_type}" == "tag" ]]; then
+            release_sha="$(gh api "repos/${repo}/git/tags/${object_sha}" --jq .object.sha)"
+          elif [[ "${object_type}" == "commit" ]]; then
+            release_sha="${object_sha}"
+          else
+            echo "Unsupported upstream tag object: ${object_type}" >&2
+            exit 1
+          fi
+          [[ "${release_sha}" =~ ^[0-9a-f]{40}$ ]]
+          release_short="${release_sha:0:7}"
+          release_version="${latest_tag#v}"
+
+          targets='[]'
+          matrix='[]'
+
+          # add_target NAME SHA SHORT VERSION TAGS_JSON
+          add_target() {
+            local name="$1" sha="$2" short="$3" version="$4" tags_json="$5"
+            targets="$(jq -c --arg n "${name}" --arg sha "${sha}" --arg s "${short}" \
+              --arg v "${version}" --argjson t "${tags_json}" \
+              '. + [{name:$n,sha:$sha,short_sha:$s,version:$v,tags:$t}]' <<<"${targets}")"
+            matrix="$(jq -c --arg n "${name}" --arg sha "${sha}" --arg s "${short}" --arg v "${version}" \
+              '. + [
+                {name:$n,sha:$sha,short_sha:$s,version:$v,runner:"ubuntu-24.04",platform:"linux/amd64",platform_tag:"amd64"},
+                {name:$n,sha:$sha,short_sha:$s,version:$v,runner:"ubuntu-24.04-arm",platform:"linux/arm64",platform_tag:"arm64"}
+              ]' <<<"${matrix}")"
+          }
+
+          wants() { # $1 = short sha
+            [[ "${FORCE_REBUILD}" == "true" ]] || ! is_published "$1"
+          }
+
+          if [[ "${release_sha}" == "${main_sha}" ]]; then
+            # The head IS the release commit: one image, every tag applies.
+            if wants "${main_short}"; then
+              add_target main "${main_sha}" "${main_short}" "${release_version}" \
+                "$(jq -cn --arg a "sha-${main_short}" --arg b "${release_version}" --arg c latest '[$a,$b,$c]')"
+            fi
+          else
+            if wants "${main_short}"; then
+              add_target main "${main_sha}" "${main_short}" "" \
+                "$(jq -cn --arg a "sha-${main_short}" --arg b latest '[$a,$b]')"
+            fi
+            if wants "${release_short}"; then
+              add_target release "${release_sha}" "${release_short}" "${release_version}" \
+                "$(jq -cn --arg a "sha-${release_short}" --arg b "${release_version}" '[$a,$b]')"
             fi
           fi
 
-          echo "should_build=${should_build}" >>"${GITHUB_OUTPUT}"
+          has_targets=false
+          if [[ "$(jq 'length' <<<"${targets}")" != "0" ]]; then
+            has_targets=true
+          fi
+
+          {
+            echo "has_targets=${has_targets}"
+            echo "targets=$(jq -c . <<<"${targets}")"
+            echo "matrix=$(jq -c . <<<"${matrix}")"
+          } >>"${GITHUB_OUTPUT}"
+
+          {
+            echo "### Cumora build plan"
+            echo
+            echo "- main sync: \`${main_sha}\` (\`${main_short}\`)"
+            echo "- latest release: \`${latest_tag}\` -> \`${release_sha}\`"
+            echo "- builds required: \`${has_targets}\`"
+            echo
+            echo '```'
+            jq -r '.[] | "\(.name)  \(.sha)  tags=\(.tags | join(","))"' <<<"${targets}" || true
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"
 
   build:
-    name: Build ${{ matrix.platform }} image
+    name: Build ${{ matrix.name }} ${{ matrix.platform }}
     needs: resolve
-    if: needs.resolve.outputs.should_build == 'true'
+    if: needs.resolve.outputs.has_targets == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -155,35 +203,26 @@ jobs:
       fail-fast: false
       matrix:
         # Native runners per architecture: the image runs a full `npm ci`
-        # twice (runtime deps + SPA build), which is far slower under QEMU
-        # emulation than on a native arm64 runner.
-        include:
-          - runner: ubuntu-24.04
-            platform: linux/amd64
-            platform_tag: amd64
-          - runner: ubuntu-24.04-arm
-            platform: linux/arm64
-            platform_tag: arm64
+        # twice (runtime deps + SPA build), far slower under QEMU emulation
+        # than on a native arm64 runner.
+        include: ${{ fromJSON(needs.resolve.outputs.matrix) }}
     env:
       BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-      SHORT_SHA: ${{ needs.resolve.outputs.short_sha }}
+      SHORT_SHA: ${{ matrix.short_sha }}
     steps:
       - name: Check out pinned upstream source
         uses: actions/checkout@v7
         with:
           repository: ${{ env.UPSTREAM_REPOSITORY }}
-          ref: ${{ needs.resolve.outputs.sha }}
+          ref: ${{ matrix.sha }}
           persist-credentials: false
 
       - name: Verify upstream source and image definition
         env:
-          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
-          EXPECTED_VERSION: ${{ needs.resolve.outputs.version }}
+          EXPECTED_SHA: ${{ matrix.sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${EXPECTED_SHA}"
-          version="$(jq -r .version package.json)"
-          test "${version}" = "${EXPECTED_VERSION}"
           test -f "${UPSTREAM_DOCKERFILE}"
           test -f "${UPSTREAM_DOCKERFILE}.dockerignore"
 
@@ -213,8 +252,8 @@ jobs:
             org.opencontainers.image.url=https://github.com/${{ env.UPSTREAM_REPOSITORY }}
             org.opencontainers.image.title=Cumora server
             org.opencontainers.image.description=Where agent teams gather - API, agent runtime and web client in one image
-            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
-            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.version=${{ matrix.version || matrix.short_sha }}
+            org.opencontainers.image.revision=${{ matrix.sha }}
             org.opencontainers.image.licenses=MIT
           cache-from: type=gha,scope=cumora-${{ matrix.platform_tag }}
           cache-to: type=gha,mode=max,scope=cumora-${{ matrix.platform_tag }}
@@ -222,19 +261,21 @@ jobs:
           sbom: true
 
   publish:
-    name: Publish multi-platform manifests
+    name: Publish ${{ matrix.name }} manifests
     needs: [resolve, build]
-    if: needs.resolve.outputs.should_build == 'true'
+    if: needs.resolve.outputs.has_targets == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.targets) }}
     env:
       BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-      SHORT_SHA: ${{ needs.resolve.outputs.short_sha }}
-      VERSION: ${{ needs.resolve.outputs.version }}
-      IS_DEFAULT_BRANCH: ${{ needs.resolve.outputs.is_default_branch }}
+      SHORT_SHA: ${{ matrix.short_sha }}
     steps:
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -248,30 +289,28 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and verify manifests
+        env:
+          TAGS: ${{ join(matrix.tags, ' ') }}
         run: |
           set -euo pipefail
 
-          images=(
+          bases=(
             "docker.io/${DOCKERHUB_NAMESPACE}/${IMAGE}"
             "ghcr.io/${GITHUB_REPOSITORY_OWNER}/${IMAGE}"
           )
+          read -ra tags <<<"${TAGS}"
 
-          for image in "${images[@]}"; do
-            tags=(
-              --tag "${image}:sha-${SHORT_SHA}"
-              --tag "${image}:${VERSION}"
-            )
-            # Only the current upstream HEAD may move `latest`; a rebuild of
-            # an older commit (manual dispatch) must not.
-            if [[ "${IS_DEFAULT_BRANCH}" == "true" ]]; then
-              tags+=(--tag "${image}:latest")
-            fi
+          for base in "${bases[@]}"; do
+            args=()
+            for tag in "${tags[@]}"; do
+              args+=(--tag "${base}:${tag}")
+            done
 
-            docker buildx imagetools create "${tags[@]}" \
-              "${image}:build-${SHORT_SHA}-${BUILD_ID}-amd64" \
-              "${image}:build-${SHORT_SHA}-${BUILD_ID}-arm64"
+            docker buildx imagetools create "${args[@]}" \
+              "${base}:build-${SHORT_SHA}-${BUILD_ID}-amd64" \
+              "${base}:build-${SHORT_SHA}-${BUILD_ID}-arm64"
 
-            docker buildx imagetools inspect --raw "${image}:sha-${SHORT_SHA}" \
+            docker buildx imagetools inspect --raw "${base}:${tags[0]}" \
               | jq -e '
                   [.manifests[]?.platform
                     | select(.os == "linux")
@@ -298,18 +337,20 @@ jobs:
           fi
 
       - name: Summary
+        env:
+          TAGS: ${{ join(matrix.tags, ' ') }}
+          NAME: ${{ matrix.name }}
         run: |
           {
-            echo "### Cumora image published"
+            echo "### Cumora ${NAME} image published"
             echo
             echo "- commit: \`${SHORT_SHA}\`"
-            echo "- version: \`${VERSION}\`"
-            echo "- tags: \`sha-${SHORT_SHA}\`, \`${VERSION}\`$([[ "${IS_DEFAULT_BRANCH}" == "true" ]] && echo ', `latest`')"
+            echo "- tags: \`${TAGS// /, }\`"
             echo "- platforms: \`linux/amd64\`, \`linux/arm64\`"
             echo
             echo '```'
-            echo "docker.io/${DOCKERHUB_NAMESPACE}/${IMAGE}:sha-${SHORT_SHA}"
-            echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/${IMAGE}:sha-${SHORT_SHA}"
+            echo "docker.io/${DOCKERHUB_NAMESPACE}/${IMAGE}:${TAGS%% *}"
+            echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/${IMAGE}:${TAGS%% *}"
             echo '```'
           } >>"${GITHUB_STEP_SUMMARY}"
 
@@ -319,7 +360,7 @@ jobs:
     # activity. When there is nothing to build, commit a timestamp so the
     # six-hour check keeps running.
     needs: resolve
-    if: needs.resolve.outputs.should_build != 'true' && github.event_name == 'schedule'
+    if: needs.resolve.outputs.has_targets != 'true' && github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
